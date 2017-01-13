@@ -1,10 +1,13 @@
-from flask import Flask, render_template, request, url_for, jsonify
+import gevent.monkey
+
+gevent.monkey.patch_all()
+
+from flask import Flask, request
 from celery import Celery
-import requests
-import gevent
-import json
 from flaskext.mysql import MySQL
+from flask_sqlalchemy import SQLAlchemy
 import datetime
+import grequests
 
 app = Flask(__name__)
 mysql = MySQL()
@@ -15,11 +18,8 @@ app.config['CELERY_RESULT_BACKEND'] = 'rpc://'
 celery = Celery(app.name, broker=app.config['CELERY_BROKER_URL'])
 celery.conf.update(app.config)
 
-app.config['MYSQL_DATABASE_USER'] = 'root'
-app.config['MYSQL_DATABASE_PASSWORD'] = 'admin'
-app.config['MYSQL_DATABASE_DB'] = 'sample_server'
-app.config['MYSQL_DATABASE_HOST'] = 'localhost'
-mysql.init_app(app)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:admin@localhost/sample_server'
+db = SQLAlchemy(app)
 
 
 def get_all_records():
@@ -27,10 +27,14 @@ def get_all_records():
     This method fetches all the records in the table 'datadump' and returns it
     :return:
     """
-    cursor = mysql.connect().cursor()
-    cursor.execute("SELECT * from datadump;")
-    data = cursor.fetchall()
-    return data
+    try:
+        cursor = db.session.execute("SELECT * from datadump;")
+        data = cursor.fetchall()
+
+        return data
+    except Exception as e:
+        print("error: " + str(e))
+        return "ERROR"
 
 
 def insert_record(data, url):
@@ -41,32 +45,24 @@ def insert_record(data, url):
     :return:
     """
     try:
-        conn = mysql.connect()
-        cursor = conn.cursor()
-        cursor.execute(
-                "INSERT INTO datadump(request_data, request_url, created_at) values(%s, %s, %s)",
-                (data["data"], url, datetime.datetime.now()))
-        conn.commit()
+        print("inside insert_record")
+        print("data: " + str(data))
+        print("url: " + str(url))
+
+        db.session.execute(
+                "Insert into datadump(request_data, request_url, created_at) VALUES ('" + data[
+                    "data"] + "', '" + url + "', '" + datetime.datetime.now().strftime(
+                        '%Y-%m-%d %H:%M:%S') + "')")
+        db.session.commit()
+
         return True
     except Exception as e:
         print("Error: " + str(e))
         return None
 
 
-REQUESTBIN_URL = "http://requestb.in/1c2shtm1"
-MOCKBIN_URL = "http://mockbin.org/bin/b62b4b9f-826e-43c5-a1c4-61a47b0503ee"
-
-
-def worker(url, payload):
-    """
-    The gevent worker which performs the task
-    :param url:
-    :param payload:
-    :return:
-    """
-    response = requests.request("POST", url, data=json.dumps(payload))
-    print("url " + str(url) + " - " + str(response.status_code))
-    insert_record(payload, url)
+URLS = ["http://requestb.in/1c2shtm1",
+        "http://mockbin.org/bin/b62b4b9f-826e-43c5-a1c4-61a47b0503ee"]
 
 
 @celery.task
@@ -76,10 +72,13 @@ def hit_and_store_db(payload):
     :param payload:
     :return:
     """
-    threads = list()
-    threads.append(gevent.spawn(worker, REQUESTBIN_URL, payload))
-    threads.append(gevent.spawn(worker, MOCKBIN_URL, payload))
-    gevent.joinall(threads)
+    rs = (grequests.post(u, data=payload) for u in URLS)
+    print "Requests queued up"
+    result = grequests.map(rs)
+    for response in result:
+        print str(response.status_code) + str(response.url)
+        insert_record(payload, response.url)
+        print("record inserted")
 
 
 @app.route('/')
